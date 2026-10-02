@@ -12,6 +12,7 @@
     <string name="manage_keywords">词组管理</string>
     <string name="stop_alarm">停止报警</string>
     <string name="alarm_found">⚠ 发现关键词</string>
+    <string name="recognition_ok">✓ 识别成功</string>
     <string name="torch_on">手电筒</string>
     <string name="torch_off">关手电筒</string>
     <string name="hint_ocr_empty">将镜头对准快递单文字，识别结果会显示在这里</string>

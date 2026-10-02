@@ -64,6 +64,24 @@
             app:iconGravity="textStart" />
     </LinearLayout>
 
+    <!-- 识别成功提示徽标：每次成功识别到文字时短暂显示 -->
+    <TextView
+        android:id="@+id/text_recognized_ok"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="16dp"
+        android:background="@drawable/bg_ok_badge"
+        android:paddingStart="12dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="6dp"
+        android:text="@string/recognition_ok"
+        android:textColor="#FFFFFF"
+        android:textSize="13sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
+
     <!-- 报警横幅：显示命中的关键词 + 停止按钮 -->
     <LinearLayout
         android:id="@+id/alarm_banner"

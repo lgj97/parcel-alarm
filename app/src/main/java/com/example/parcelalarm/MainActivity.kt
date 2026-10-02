@@ -40,6 +40,14 @@ class MainActivity : AppCompatActivity() {
     /** 停止报警后 4 秒内不再重复触发，避免同一张单子反复响。 */
     private val alarmSuppressMillis = 4000L
 
+    /** “识别成功”徽标显示时长。 */
+    private val okBadgeMillis = 1500L
+
+    /** 隐藏“识别成功”徽标的任务。 */
+    private val hideOkRunnable = Runnable {
+        binding.textRecognizedOk.visibility = View.GONE
+    }
+
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) startCamera() else showPermissionNeeded()
@@ -88,6 +96,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        binding.textRecognizedOk.removeCallbacks(hideOkRunnable)
         cameraExecutor?.shutdown()
         cameraExecutor = null
         alarmController.release()
@@ -134,6 +143,7 @@ class MainActivity : AppCompatActivity() {
         if (trimmed.isEmpty()) return
 
         binding.textRecognized.text = trimmed
+        showRecognizedOk()
         if (!scanning) return
 
         val normalizedText = KeywordStore.normalize(trimmed)
@@ -217,5 +227,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun showPermissionNeeded() {
         binding.layoutPermission.visibility = View.VISIBLE
+    }
+
+    /** 每次成功识别到文字时，短暂显示绿色“识别成功”徽标。 */
+    private fun showRecognizedOk() {
+        val badge = binding.textRecognizedOk
+        badge.removeCallbacks(hideOkRunnable)
+        badge.visibility = View.VISIBLE
+        badge.postDelayed(hideOkRunnable, okBadgeMillis)
     }
 }
