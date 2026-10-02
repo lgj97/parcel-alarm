@@ -4,6 +4,9 @@ import android.Manifest
 import android.animation.ValueAnimator
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.View
@@ -11,6 +14,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
@@ -19,16 +25,31 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * 主界面：后置摄像头实时取流 -> ML Kit 离线中文 OCR -> 命中关键词则报警。
+ * 主界面：后置摄像头，两种扫描模式（顶部按钮切换，选择会被记住）：
+ * 1. 单次手动拍照识别（默认）：点“拍照识别”对全分辨率照片做 OCR；
+ * 2. 持续自动扫描：相机帧持续 OCR，可暂停/继续。
+ * 识别到自定义关键词 -> 声光报警。
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var alarmController: AlarmController
+    private val ocrEngine = OcrEngine()
 
     private var camera: Camera? = null
     private var cameraExecutor: ExecutorService? = null
+
+    /** 拍照识别用例（仅手动模式）。 */
+    private var imageCapture: ImageCapture? = null
+
+    /** 持续扫描分析器（仅自动模式）。 */
     private var ocrAnalyzer: OcrAnalyzer? = null
+
+    /** true=单次手动拍照识别，false=持续自动扫描。 */
+    private var manualMode = true
+
+    /** 手动模式下一次识别进行中。 */
+    private var recognizing = false
 
     private var keywords: List<String> = emptyList()
     private var scanning = true
@@ -61,6 +82,11 @@ class MainActivity : AppCompatActivity() {
         alarmController = AlarmController(this)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
+        // 记住用户上次选择的模式
+        manualMode = ModeStore.isManualMode(this)
+
+        binding.btnMode.setOnClickListener { switchMode() }
+        binding.btnCapture.setOnClickListener { captureAndRecognize() }
         binding.btnToggleScan.setOnClickListener {
             scanning = !scanning
             updateStatus()
@@ -73,6 +99,8 @@ class MainActivity : AppCompatActivity() {
         binding.btnGrant.setOnClickListener {
             permissionLauncher.launch(Manifest.permission.CAMERA)
         }
+
+        updateModeUi()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED
@@ -99,6 +127,9 @@ class MainActivity : AppCompatActivity() {
         binding.textRecognizedOk.removeCallbacks(hideOkRunnable)
         cameraExecutor?.shutdown()
         cameraExecutor = null
+        ocrAnalyzer?.release()
+        ocrAnalyzer = null
+        ocrEngine.release()
         alarmController.release()
     }
 
@@ -115,36 +146,131 @@ class MainActivity : AppCompatActivity() {
                     it.setSurfaceProvider(binding.previewView.surfaceProvider)
                 }
 
-                ocrAnalyzer = OcrAnalyzer(
-                    isScanningEnabled = { scanning },
-                    onText = { text -> runOnUiThread { handleOcrText(text) } }
-                )
-
-                val analysis = OcrAnalyzer.buildAnalysisUseCase()
-                analysis.setAnalyzer(executor, ocrAnalyzer!!)
-
                 provider.unbindAll()
                 // 固定使用后置摄像头
-                camera = provider.bindToLifecycle(
-                    this,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analysis
-                )
+                if (manualMode) {
+                    ocrAnalyzer?.release()
+                    ocrAnalyzer = null
+                    imageCapture = ImageCapture.Builder()
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                        .build()
+                    camera = provider.bindToLifecycle(
+                        this,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        imageCapture
+                    )
+                } else {
+                    imageCapture = null
+                    ocrAnalyzer?.release()
+                    ocrAnalyzer = OcrAnalyzer(
+                        isScanningEnabled = { scanning },
+                        onText = { text -> runOnUiThread { handleOcrText(text) } }
+                    )
+                    val analysis = OcrAnalyzer.buildAnalysisUseCase()
+                    analysis.setAnalyzer(executor, ocrAnalyzer!!)
+                    camera = provider.bindToLifecycle(
+                        this,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis
+                    )
+                }
             } catch (e: Exception) {
                 binding.textStatus.text = getString(R.string.camera_error)
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** 处理一次 OCR 识别结果（主线程）。 */
+    /** 切换扫描模式并持久化，立即重新绑定相机用例。 */
+    private fun switchMode() {
+        if (recognizing) return // 手动识别进行中不允许切换
+        manualMode = !manualMode
+        ModeStore.setManualMode(this, manualMode)
+        updateModeUi()
+        startCamera()
+    }
+
+    /** 根据当前模式更新按钮可见性与文案。 */
+    private fun updateModeUi() {
+        binding.btnMode.text =
+            getString(if (manualMode) R.string.mode_manual else R.string.mode_auto)
+        binding.btnCapture.visibility = if (manualMode) View.VISIBLE else View.GONE
+        binding.btnToggleScan.visibility = if (manualMode) View.GONE else View.VISIBLE
+        updateStatus()
+    }
+
+    /** 手动模式：拍一张全分辨率照片并识别。 */
+    private fun captureAndRecognize() {
+        val capture = imageCapture ?: return
+        if (recognizing) return
+        recognizing = true
+        binding.btnCapture.isEnabled = false
+        binding.btnCapture.text = getString(R.string.recognizing)
+
+        capture.takePicture(
+            ContextCompat.getMainExecutor(this),
+            object : ImageCapture.OnImageCapturedCallback() {
+                override fun onCaptureSuccess(image: ImageProxy) {
+                    val bitmap = image.toUprightBitmap()
+                    image.close()
+                    if (bitmap == null) {
+                        resetCaptureUi()
+                        binding.textRecognized.text = getString(R.string.capture_failed)
+                        return
+                    }
+                    ocrEngine.recognize(bitmap) { text ->
+                        bitmap.recycle()
+                        resetCaptureUi()
+                        if (text.isNullOrBlank()) {
+                            binding.textRecognized.text =
+                                getString(R.string.recognize_failed_or_empty)
+                        } else {
+                            handleOcrText(text)
+                        }
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    resetCaptureUi()
+                    binding.textRecognized.text = getString(R.string.capture_failed)
+                }
+            }
+        )
+    }
+
+    private fun resetCaptureUi() {
+        recognizing = false
+        binding.btnCapture.isEnabled = true
+        binding.btnCapture.text = getString(R.string.capture_recognize)
+    }
+
+    /** ImageProxy(JPEG) 转正立 Bitmap，按相机旋转角度纠正方向。 */
+    private fun ImageProxy.toUprightBitmap(): Bitmap? = try {
+        val buffer = planes[0].buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+        var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val rotation = imageInfo.rotationDegrees
+        if (bitmap != null && rotation != 0) {
+            val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+            val rotated =
+                Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            if (rotated != bitmap) bitmap.recycle()
+            bitmap = rotated
+        }
+        bitmap
+    } catch (e: Exception) {
+        null
+    }
+
+    /** 处理一次 OCR 识别结果（主线程），两种模式共用。 */
     private fun handleOcrText(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
 
         binding.textRecognized.text = trimmed
         showRecognizedOk()
-        if (!scanning) return
 
         val normalizedText = KeywordStore.normalize(trimmed)
         val matched = keywords
@@ -215,10 +341,11 @@ class MainActivity : AppCompatActivity() {
     private fun updateStatus() {
         val state = when {
             alarming -> getString(R.string.status_alarming)
-            !scanning -> getString(R.string.status_paused)
             keywords.isEmpty() -> getString(R.string.status_no_keywords)
-            else -> getString(R.string.status_scanning) + " · " +
+            manualMode -> getString(R.string.status_ready)
+            scanning -> getString(R.string.status_scanning) + " · " +
                 keywords.size + " " + getString(R.string.keyword_unit)
+            else -> getString(R.string.status_paused)
         }
         binding.textStatus.text = state
         binding.btnToggleScan.text =

@@ -1,8 +1,7 @@
 package com.example.parcelalarm
 
 import android.graphics.Bitmap
-import android.os.SystemClock
-import android.util.Size
+import android.graphics.Matrix
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -11,108 +10,108 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * CameraX 帧分析器：把相机帧转成 Bitmap 后交给 ML Kit 离线中文 OCR，
- * 识别到的完整文字通过 onText 回调（主线程）返回。
- *
- * 内置节流：两次识别至少间隔 SCAN_INTERVAL_MS，且上一帧未处理完时丢弃新帧，
- * 避免低端机 CPU 过载。
+ * 持续自动扫描模式的分析器：把相机帧转成 Bitmap 交给 ML Kit 中文 OCR。
  */
 class OcrAnalyzer(
-    private val isScanningEnabled: () -> Boolean,
-    private val onText: (String) -> Unit
+    private val onText: (String) -> Unit,
+    private val isScanningEnabled: () -> Boolean
 ) : ImageAnalysis.Analyzer {
 
     private val recognizer =
         TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
 
-    private var busy = false
-    private var lastRunAt = 0L
+    /** 防止 ML Kit 任务堆积：上一次识别完成前丢弃新帧。 */
+    private val busy = AtomicBoolean(false)
+
+    /** 连续识别节流间隔（毫秒），避免持续满负荷识别浪费电。 */
+    private val throttleMillis = 1200L
+    private var lastAnalyzeAt = 0L
 
     override fun analyze(image: ImageProxy) {
-        val enabled = isScanningEnabled()
-        val now = SystemClock.elapsedRealtime()
-        if (!enabled || busy || now - lastRunAt < SCAN_INTERVAL_MS) {
+        if (!isScanningEnabled() || !busy.compareAndSet(false, true)) {
             image.close()
             return
         }
-        lastRunAt = now
-        busy = true
-
-        val rotationDegrees = image.imageInfo.rotationDegrees
-        val bitmap = image.toArgbBitmap()
-        image.close()
-
-        if (bitmap == null) {
-            busy = false
+        val now = System.currentTimeMillis()
+        if (now - lastAnalyzeAt < throttleMillis) {
+            busy.set(false)
+            image.close()
             return
         }
-
-        recognizer.process(InputImage.fromBitmap(bitmap, rotationDegrees))
-            .addOnSuccessListener { result ->
-                if (enabled) {
-                    onText(result.text)
+        lastAnalyzeAt = now
+        try {
+            val rotation = image.imageInfo.rotationDegrees
+            val bitmap = image.toArgbBitmap().let { bmp ->
+                if (rotation == 0) bmp
+                else {
+                    val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                    Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
                 }
             }
-            .addOnCompleteListener {
-                busy = false
-                if (!bitmap.isRecycled) {
-                    bitmap.recycle()
+            recognizer.process(InputImage.fromBitmap(bitmap, rotation))
+                .addOnSuccessListener { result ->
+                    if (result.text.isNotBlank()) onText(result.text)
                 }
-            }
+                .addOnCompleteListener {
+                    busy.set(false)
+                }
+        } catch (e: Exception) {
+            busy.set(false)
+        } finally {
+            image.close()
+        }
     }
 
-    /**
-     * CameraX 输出格式为 RGBA_8888 时只有 plane[0] 一个平面。
-     * 注意处理 rowStride 大于 width*4 的情况（行末对齐填充）。
-     */
-    private fun ImageProxy.toArgbBitmap(): Bitmap? = try {
+    fun release() {
+        recognizer.close()
+    }
+
+    /** CameraX 默认输出的 RGBA_8888 帧转 ARGB_8888 Bitmap。 */
+    private fun ImageProxy.toArgbBitmap(): Bitmap {
         val plane = planes[0]
-        val buffer = plane.buffer
-        val w = width
-        val h = height
         val rowStride = plane.rowStride
         val pixelStride = plane.pixelStride
-        val rowBytes = w * pixelStride
-
-        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        if (rowStride == rowBytes) {
-            bitmap.copyPixelsFromBuffer(buffer)
+        val width = this.width
+        val height = this.height
+        val rowPadding = (rowStride - width * pixelStride) / pixelStride
+        val bitmapWidth = width + rowPadding
+        val tight = ByteArray(bitmapWidth * height * pixelStride)
+        if (pixelStride == 1) {
+            plane.buffer.get(tight, 0, tight.size)
         } else {
-            // 逐行去除 padding 后再填充
-            val tight = ByteArray(rowBytes * h)
-            var offset = 0
-            for (y in 0 until h) {
-                buffer.position(y * rowStride)
-                buffer.get(tight, offset, rowBytes)
-                offset += rowBytes
+            val src = ByteArray(rowStride * height)
+            plane.buffer.get(src, 0, src.size)
+            var dst = 0
+            for (row in 0 until height) {
+                var col = 0
+                val rowStart = row * rowStride
+                while (col < width) {
+                    val index = rowStart + col * pixelStride
+                    tight[dst++] = src[index]
+                    col++
+                }
+                dst += rowPadding * pixelStride
             }
-            bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(tight))
         }
-        bitmap
-    } catch (t: Throwable) {
-        null
+        val bitmap = Bitmap.createBitmap(bitmapWidth, height, Bitmap.Config.ARGB_8888)
+        bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(tight))
+        return if (rowPadding == 0) bitmap
+        else Bitmap.createBitmap(bitmap, 0, 0, width, height)
     }
 
     companion object {
-        private const val SCAN_INTERVAL_MS = 1200L
-
-        /** 构建图像分析用例：720P、RGBA 输出、只保留最新帧。 */
-        fun buildAnalysisUseCase(): ImageAnalysis =
-            ImageAnalysis.Builder()
-                .setResolutionSelector(
-                    ResolutionSelector.Builder()
-                        .setResolutionStrategy(
-                            ResolutionStrategy(
-                                Size(1280, 720),
-                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
-                            )
-                        )
-                        .build()
-                )
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
+        /** 构建持续扫描用例：720P 左右，帧率足够 OCR 使用。 */
+        fun buildAnalysisUseCase(): ImageAnalysis = ImageAnalysis.Builder()
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setResolutionStrategy(ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+                    .build()
+            )
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
     }
 }
